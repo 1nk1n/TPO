@@ -1,0 +1,5 @@
+selenium==4.51.0
+pytest==8.4.2
+requests==2.34.2
+locust==2.47.0
+urllib3==2.8.0

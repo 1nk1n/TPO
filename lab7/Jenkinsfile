@@ -1,0 +1,161 @@
+pipeline {
+    agent any
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    environment {
+        PATH = "/opt/venv/bin:${env.PATH}"
+        HEADLESS = '1'
+        OPENBMC_URL = 'https://127.0.0.1:2443'
+        OPENBMC_API_URL = 'https://127.0.0.1:2443'
+        OPENBMC_USERNAME = 'root'
+        OPENBMC_PASSWORD = '0penBmc'
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                deleteDir()
+                sh '''#!/bin/bash
+set -euo pipefail
+mkdir -p reports/prepare reports/qemu reports/api reports/webui reports/load .runtime
+cp /opt/lab-source/test_redfish.py .
+cp /opt/lab-source/openbmc_auth_tests.py .
+cp /opt/lab-source/pytest.ini .
+cp -r /opt/lab-source/lab6 .
+cp /opt/openbmc/obmc-phosphor-image-romulus.static.mtd .runtime/flash.mtd
+{
+    python --version
+    pip check
+    qemu-system-arm --version
+    chromium --version
+    chromedriver --version
+} > reports/prepare/environment.txt 2>&1
+'''
+            }
+        }
+
+        stage('Start OpenBMC') {
+            options {
+                timeout(time: 15, unit: 'MINUTES')
+            }
+            steps {
+                sh '''#!/bin/bash
+set -euo pipefail
+JENKINS_NODE_COOKIE=lab7-qemu qemu-system-arm -M romulus-bmc -m 256 -display none -monitor none -serial "file:$WORKSPACE/reports/qemu/console.log" -drive "file=$WORKSPACE/.runtime/flash.mtd,format=raw,if=mtd" -net nic -net user,hostfwd=tcp:127.0.0.1:2443-:443,hostfwd=udp:127.0.0.1:2623-:623 -daemonize -pidfile "$WORKSPACE/.runtime/qemu.pid" > reports/qemu/start.log 2>&1
+
+for attempt in $(seq 1 120); do
+    code=$(curl -sk --max-time 5 -u "$OPENBMC_USERNAME:$OPENBMC_PASSWORD" -o reports/qemu/system.json -w '%{http_code}' "$OPENBMC_URL/redfish/v1/Systems/system" || true)
+    echo "Attempt $attempt: HTTP $code" | tee -a reports/qemu/readiness.log
+    if [ "$code" = "200" ]; then
+        date -Is > reports/qemu/ready.txt
+        exit 0
+    fi
+    sleep 5
+done
+
+echo "OpenBMC did not become ready" | tee -a reports/qemu/readiness.log
+exit 1
+'''
+            }
+        }
+
+        stage('API tests') {
+            options {
+                timeout(time: 10, unit: 'MINUTES')
+            }
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                    sh '''#!/bin/bash
+set -euo pipefail
+python -m pytest test_redfish.py -v --junitxml=reports/api/junit.xml 2>&1 | tee reports/api/pytest.log
+'''
+                }
+            }
+        }
+
+        stage('Web UI tests') {
+            options {
+                timeout(time: 15, unit: 'MINUTES')
+            }
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                    sh '''#!/bin/bash
+set -euo pipefail
+python -m pytest openbmc_auth_tests.py -v --junitxml=reports/webui/junit.xml 2>&1 | tee reports/webui/pytest.log
+
+python - <<'PY' 2>&1 | tee reports/webui/completeness.log
+import xml.etree.ElementTree as ET
+
+cases = list(ET.parse("reports/webui/junit.xml").iter("testcase"))
+skipped = [case.get("name") for case in cases if case.find("skipped") is not None]
+print("Collected:", len(cases))
+print("Skipped:", skipped)
+if not cases:
+    raise SystemExit("Web UI tests were not collected")
+PY
+'''
+                }
+            }
+        }
+
+        stage('Load tests') {
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                    sh '''#!/bin/bash
+set -euo pipefail
+locust -f lab6/locustfile.py OpenBMCUser --headless --users 10 --spawn-rate 2 --run-time 60s --exit-code-on-error 1 --csv reports/load/locust --html reports/load/report.html 2>&1 | tee reports/load/locust.log
+
+python - <<'PY' 2>&1 | tee reports/load/completeness.log
+import csv
+
+with open("reports/load/locust_stats.csv", newline="") as stream:
+    rows = list(csv.DictReader(stream))
+total = next((row for row in rows if row["Name"] == "Aggregated"), None)
+if total is None or int(total["Request Count"]) <= 0:
+    raise SystemExit("Load test produced no requests")
+print("Requests:", total["Request Count"])
+print("Failures:", total["Failure Count"])
+PY
+'''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh(returnStatus: true, script: '''#!/bin/bash
+python - <<'PY'
+import os
+import signal
+from pathlib import Path
+
+pidfile = Path(".runtime/qemu.pid")
+if pidfile.exists():
+    pid = int(pidfile.read_text().strip())
+    cmdline = Path(f"/proc/{pid}/cmdline")
+    expected = str(Path(".runtime/flash.mtd").resolve()).encode()
+    try:
+        if expected in cmdline.read_bytes():
+            os.kill(pid, signal.SIGTERM)
+            print("Stopped QEMU:", pid)
+    except ProcessLookupError:
+        print("QEMU already stopped")
+    except FileNotFoundError:
+        print("QEMU already stopped")
+PY
+''')
+            archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true
+            junit testResults: 'reports/api/junit.xml,reports/webui/junit.xml', allowEmptyResults: true
+        }
+    }
+}

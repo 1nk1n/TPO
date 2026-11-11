@@ -1,0 +1,13 @@
+services:
+  jenkins:
+    image: tpo-jenkins:lab7
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - ..:/opt/lab-source:ro
+      - /home/inkin/openbmc-lab:/opt/openbmc:ro
+    shm_size: "1gb"
+
+volumes:
+  jenkins_home:
